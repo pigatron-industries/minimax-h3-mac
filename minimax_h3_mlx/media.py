@@ -20,6 +20,7 @@ from minimax_h3_mlx.media_tools import media_tool_error, resolve_media_tool
 def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
     """Write ``(channels, samples)`` float audio in ``[-1, 1]`` as 16-bit PCM."""
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim == 1:
         audio = audio[None]
@@ -59,6 +60,7 @@ def save_mp4(
     ffmpeg_path = _resolve_executable("ffmpeg", ffmpeg, env_var="MINIMAX_H3_FFMPEG")
 
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     video = np.ascontiguousarray(video, dtype=np.uint8)
     frames, height, width, _ = video.shape
 

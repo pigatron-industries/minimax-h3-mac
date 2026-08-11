@@ -32,6 +32,79 @@ preflight. The checked-in defaults therefore remain conservative, and experiment
 paths stay disabled until they pass the repository's numerical, media-quality, memory, and
 wall-clock gates.
 
+For the current M4 Pro 24 GB 320×192 / 5 s / 5-step low-memory dense/off path, every new
+VideoVAE route below remains **explicit/default-off**. None changes `balanced` or the historical
+FP32 tiled decode default.
+
+The full-grid decode switch is a quality-bounded opt-in, not strict parity:
+
+```bash
+--video-vae-disable-decode-tiling
+```
+
+Two same-class runs showed material wall/decode gains with acceptable paired media quality, but the
+fresh toy-train/seed-19 replication added `3,908` swapouts versus baseline `0`. Do not rebase
+`--profile speed` onto full-grid decode without a same-class replication that is also no-worse on
+pageouts/swapouts/MLX peak. Evidence:
+`experiments/video_vae_full_grid_rebase_replication_20260811T064219Z/ab_decision.json`.
+
+Plain default-tiled `--video-vae-precision bf16` now has mixed release-speed evidence rather than a
+stable retained-speed claim. On the compliant adult-dancing seed-31 same-session A/B, BF16 remained
+media-valid, quality-valid, and no-worse on MLX peak/pageouts/swapouts, and it reduced VideoVAE
+load+decode by `2.38 s`; however end-to-end wall regressed by `2.85 s` because DiT forward was
+slower in that paired run. Keep BF16 explicit/default-off as a runnable candidate/provenance route,
+keep balanced/default FP32 behavior unchanged, and do not advertise plain BF16 as release-speed
+stable without a fresh same-class positive replication. Evidence:
+`experiments/video_vae_bf16_adult_dancing_ab_20260811T082639Z/ab_decision.json`.
+
+The two-flag BF16 full-grid command is also demoted from release-speed documentation:
+
+```bash
+--video-vae-precision bf16 --video-vae-disable-decode-tiling
+```
+
+It remains a runnable quality-bounded experiment, but the adult-dancing seed-31 3-way gate found
+only a `1.25 s` end-to-end gain versus FP32 tiled, below the `3.0 s` materiality threshold, despite
+valid media/quality and no-worse VM. A separate toy-train 3-way had stronger wall/decode gains but
+failed the no-worse-VM criterion versus the BF16 tiled control because pageouts increased. Evidence:
+`experiments/video_vae_bf16_full_grid_adult_3way_20260811T084024Z/three_way_decision.json` and
+`experiments/video_vae_bf16_full_grid_3way_20260811T080454Z/three_way_decision.json`.
+
+The triple BF16 full-grid skip-sync command remains explicit/default-off rather than a retained
+release-speed claim:
+
+```bash
+--video-vae-precision bf16 --video-vae-disable-decode-tiling --video-vae-skip-decode-sync
+```
+
+The single cat/seed-7 run was positive and VM-clean, but the fresh toy-train/seed-19 A/B was faster
+and media/quality-valid while failing the no-worse-VM gate because candidate pageouts were higher
+than the FP32 tiled baseline. Evidence:
+`experiments/video_vae_triple_toy_train_ab_20260811T073749Z/ab_decision.json`.
+
+Default-tiled BF16 plus skip-sync, without full-grid decode, is rejected as a release-speed command
+on the toy-train gate. It produced valid media and exact output relative to default-tiled BF16, but
+wall time regressed (`140.56 s` vs `126.74 s` FP32 tiled and `126.38 s` BF16 tiled) and VideoVAE
+load+decode was not better than the BF16 tiled control. Keep `--video-vae-skip-decode-sync`
+explicit/default-off for profiling. Evidence:
+`experiments/video_vae_bf16_tiled_skip_sync_3way_20260811T074846Z/three_way_decision.json`.
+
+Plain `--video-vae-precision fp16` is not a retained release-speed command from the compliant
+adult-dancing seed-31 same-session A/B. The chosen FP16 full-grid candidate produced valid media and
+passed paired quality (RGB PSNR `41.32 dB`, luma SSIM mean `0.9848`, exact audio) with no-worse VM
+(equal MLX peak, fewer pageouts/swapouts) and faster VideoVAE load+decode (`14.35 s` vs `24.66 s`),
+but end-to-end wall regressed (`129.45 s` vs `123.64 s`) because DiT forward was slower in that run.
+Keep FP16 explicit/default-off/provenance-only, keep default FP32 tiled behavior unchanged, and do
+not advertise it as a speed route without fresh same-class positive evidence. Evidence:
+`experiments/video_vae_fp16_full_grid_adult_ab_20260811T085821Z/ab_decision.json`.
+
+The VideoVAE decoder `QuantizedLinear` route is implemented only as a default-off loader/profiler
+probe and is rejected as a speed optimization on this MLX/Mac state. Focused 320×192-shaped full-grid
+decode microbenches showed 8-bit and 4-bit decoder quantization reduced post-load active MLX memory
+but slowed load+decode versus the unquantized decoder; 4-bit also caused much larger decoded-image
+deltas. No end-to-end generation A/B was spent after the focused gate failed. Evidence:
+`experiments/video_vae_decoder_quant_gate_20260811T063353Z/result.json`.
+
 ## Upstream foundation
 
 MLX (Apple Silicon) port of [**MiniMaxAI/MiniMax-H3**](https://huggingface.co/MiniMaxAI/MiniMax-H3) —

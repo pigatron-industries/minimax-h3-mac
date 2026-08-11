@@ -36,6 +36,8 @@ DENSE_DEQUANT_PROFILE_CHOICES = (
     "qkv-fc2-out-resident",
     "qkv-fc2-out-tiled",
 )
+VIDEO_VAE_DECODER_QUANTIZATION_CHOICES = ("off", "8bit", "4bit")
+VIDEO_VAE_PRECISION_CHOICES = ("fp32", "bf16", "fp16")
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="experimental disabled-by-default guard: zero MLX cache, set memory/wired limits, and drain caches at stage boundaries",
     )
+    parser.add_argument(
+        "--video-vae-skip-decode-sync",
+        action="store_true",
+        help=(
+            "experimental disabled-by-default candidate: skip internal mx.eval boundaries inside "
+            "VideoVAE decode and rely on outer generation/profile synchronization"
+        ),
+    )
+    parser.add_argument(
+        "--video-vae-disable-decode-tiling",
+        action="store_true",
+        help=(
+            "experimental disabled-by-default candidate: decode VideoVAE clips as one full spatial "
+            "grid instead of the historical overlapped decode tiles; encoder tiling is unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--video-vae-decoder-quantization",
+        choices=VIDEO_VAE_DECODER_QUANTIZATION_CHOICES,
+        default="off",
+        help=(
+            "experimental disabled-by-default candidate: pack quantizable VideoVAE decoder Linear "
+            "layers from local source weights as MLX QuantizedLinear at 8bit or 4bit; off preserves "
+            "the historical unquantized VideoVAE loader"
+        ),
+    )
+    parser.add_argument(
+        "--video-vae-precision",
+        choices=VIDEO_VAE_PRECISION_CHOICES,
+        default="fp32",
+        help=(
+            "experimental disabled-by-default candidate: use bf16 or fp16 to cast VideoVAE "
+            "floating parameters while loading and decode with matching lower-precision "
+            "latents/activations; fp32 preserves the historical source-precision VideoVAE path"
+        ),
+    )
     parser.add_argument("--ffmpeg", default=None, help="ffmpeg executable used for MP4 muxing; may be repo-local or an absolute path")
     parser.add_argument("--require-muxed-mp4", action="store_true", help="fail instead of writing frames+WAV fallback if MP4 muxing fails")
     parser.add_argument(
@@ -275,6 +313,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the selected profile and disable residual block cache",
     )
     parser.add_argument("--block-cache-threshold", type=float, default=0.12, help="maximum adjacent sigma delta for block-cache reuse")
+    parser.add_argument(
+        "--block-cache-start-percent",
+        type=float,
+        default=0.10,
+        help="first normalized denoising-step position eligible for block-cache reuse",
+    )
+    parser.add_argument(
+        "--block-cache-end-percent",
+        type=float,
+        default=0.90,
+        help="last normalized denoising-step position eligible for block-cache reuse",
+    )
     parser.add_argument("--block-cache-depth", type=float, default=0.75, help="fraction of trailing transformer blocks served from cache")
     parser.add_argument("--block-cache-max-consecutive", type=int, default=2, help="maximum cached steps before a forced full refresh")
     parser.add_argument(
@@ -373,6 +423,8 @@ def parse_args(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | No
         parser.error("--memory-limit-gb must be positive")
     if args.block_cache_threshold < 0:
         parser.error("--block-cache-threshold must be non-negative")
+    if not 0.0 <= args.block_cache_start_percent <= args.block_cache_end_percent <= 1.0:
+        parser.error("--block-cache-start-percent/end-percent must satisfy 0 <= start <= end <= 1")
     if not 0.0 <= args.block_cache_depth < 1.0:
         parser.error("--block-cache-depth must satisfy 0 <= depth < 1")
     if args.block_cache_max_consecutive < 0:
@@ -420,6 +472,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             dense_dequant_ffn_fc2_tile_size=args.ffn_fc2_tile_size,
             dense_dequant_attention_out_tile_size=args.attention_out_tile_size,
             memory_pressure_guard=args.memory_pressure_guard,
+            video_vae_skip_decode_sync=args.video_vae_skip_decode_sync,
+            video_vae_disable_decode_tiling=args.video_vae_disable_decode_tiling,
+            video_vae_decoder_quantization=args.video_vae_decoder_quantization,
+            video_vae_precision=args.video_vae_precision,
         )
         result = pipe(
             args.prompt,
@@ -435,6 +491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             block_cache_config=(
                 BlockCacheConfig(
                     sigma_threshold=args.block_cache_threshold,
+                    start_percent=args.block_cache_start_percent,
+                    end_percent=args.block_cache_end_percent,
                     max_consecutive=args.block_cache_max_consecutive,
                     cache_depth=args.block_cache_depth,
                 )

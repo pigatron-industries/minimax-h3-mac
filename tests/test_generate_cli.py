@@ -65,7 +65,13 @@ def test_profile_presets_parse_and_explicit_flags_win() -> None:
     assert_case("speed profile enables block cache", speed.block_cache is True)
     assert_case("text conditioning cache remains opt-in", speed.cache_text_conditioning is False)
     assert_case("memory pressure guard remains opt-in", speed.memory_pressure_guard is False)
+    assert_case("VideoVAE decode sync-skip remains opt-in", speed.video_vae_skip_decode_sync is False)
+    assert_case("VideoVAE decode tiling remains enabled by default", speed.video_vae_disable_decode_tiling is False)
+    assert_case("VideoVAE decoder quantization remains opt-in", speed.video_vae_decoder_quantization == "off")
+    assert_case("VideoVAE lower precision remains opt-in", speed.video_vae_precision == "fp32")
     assert_case("stream block group size keeps default one-block residency", speed.stream_block_group_size == 1)
+    assert_case("block cache middle-window start default parses", speed.block_cache_start_percent == 0.10)
+    assert_case("block cache middle-window end default parses", speed.block_cache_end_percent == 0.90)
     assert_case("dense-dequant generation profile remains opt-in", speed.dense_dequant_profile == "off")
     parser = module.build_parser()
     block_loader_actions = [action for action in parser._actions if "--block-load-mode" in action.option_strings]
@@ -85,6 +91,41 @@ def test_profile_presets_parse_and_explicit_flags_win() -> None:
         env={},
     )
     assert_case("memory pressure guard can be requested", memory_guard.memory_pressure_guard is True)
+    decode_sync = module.parse_args(
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-skip-decode-sync"],
+        env={},
+    )
+    assert_case("VideoVAE decode sync-skip can be requested", decode_sync.video_vae_skip_decode_sync is True)
+    decode_full_grid = module.parse_args(
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-disable-decode-tiling"],
+        env={},
+    )
+    assert_case("VideoVAE full-grid decode can be requested", decode_full_grid.video_vae_disable_decode_tiling is True)
+    decoder_quantized = module.parse_args(
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-decoder-quantization", "8bit"],
+        env={},
+    )
+    assert_case("VideoVAE decoder 8-bit quantization can be requested", decoder_quantized.video_vae_decoder_quantization == "8bit")
+    assert_parse_error(
+        module,
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-decoder-quantization", "int3"],
+        env={},
+    )
+    vae_bf16 = module.parse_args(
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-precision", "bf16"],
+        env={},
+    )
+    assert_case("VideoVAE BF16 precision can be requested", vae_bf16.video_vae_precision == "bf16")
+    vae_fp16 = module.parse_args(
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-precision", "fp16"],
+        env={},
+    )
+    assert_case("VideoVAE FP16 precision can be requested", vae_fp16.video_vae_precision == "fp16")
+    assert_parse_error(
+        module,
+        ["a safe prompt", "--checkpoint", "models/upstream", "--video-vae-precision", "fp64"],
+        env={},
+    )
     grouped_stream = module.parse_args(
         ["a safe prompt", "--checkpoint", "models/upstream", "--stream-block-group-size", "2"],
         env={},
@@ -93,6 +134,33 @@ def test_profile_presets_parse_and_explicit_flags_win() -> None:
     assert_parse_error(
         module,
         ["a safe prompt", "--checkpoint", "models/upstream", "--stream-block-group-size", "0"],
+        env={},
+    )
+    cache_window = module.parse_args(
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--block-cache",
+            "--block-cache-start-percent",
+            "0.25",
+            "--block-cache-end-percent",
+            "0.75",
+        ],
+        env={},
+    )
+    assert_case("block cache start/end window can be requested", cache_window.block_cache_start_percent == 0.25 and cache_window.block_cache_end_percent == 0.75)
+    assert_parse_error(
+        module,
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--block-cache-start-percent",
+            "0.8",
+            "--block-cache-end-percent",
+            "0.2",
+        ],
         env={},
     )
     dense_profile = module.parse_args(

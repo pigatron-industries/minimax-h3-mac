@@ -403,6 +403,9 @@ class ViTDecoder3d(nn.Module):
         self.proj_out = nn.Linear(
             dim, config.out_channels * config.patch_size_t * config.patch_size * config.patch_size
         )
+        # Default-on synchronization/materialization boundary preserving the historical decode path.
+        # VideoVAE owns the release-facing opt-in that may disable this during decode only.
+        self.internal_eval_boundaries = True
 
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``(B, D, H, W, C)``; returns ``(B, D*pt, H*p, W*p, out_channels)``."""
@@ -426,7 +429,8 @@ class ViTDecoder3d(nn.Module):
 
         for block in self.transformer_blocks:
             tokens = block(tokens, rotary)
-            mx.eval(tokens)
+            if self.internal_eval_boundaries:
+                mx.eval(tokens)
 
         tokens = self.proj_out(self.norm_out(tokens))[:, :num_patches, :]
 
@@ -462,6 +466,46 @@ class VideoVAE(nn.Module):
         self.tile_sample_min_width = 256
         self.tile_sample_min_overlap_height = 64
         self.tile_sample_min_overlap_width = 64
+        self.decode_internal_eval_boundaries = True
+        self.decode_spatial_tiling = True
+        self.decode_precision = "fp32"
+
+    def set_decode_spatial_tiling(self, enabled: bool) -> None:
+        """Enable/disable spatial tiling for VideoVAE decode only.
+
+        The default ``True`` preserves the historical path. Setting this to ``False`` decodes each
+        clip as a single full spatial grid while leaving encoder tiling untouched. This is a
+        quality-bounded optimization candidate, not a strict-parity switch: full-grid decoder
+        self-attention can change pixels versus independently decoded/blended tiles.
+        """
+
+        self.decode_spatial_tiling = bool(enabled)
+
+    def set_decode_internal_eval_boundaries(self, enabled: bool) -> None:
+        """Enable/disable MLX materialization boundaries inside video decode only.
+
+        The default ``True`` preserves the historical path. Setting this to ``False`` is a
+        reversible opt-in used to test whether VideoVAE decode can rely on the caller/profiler's
+        outer synchronization instead of forcing an ``mx.eval`` after every decoder block and tile.
+        Encoder boundaries are intentionally unaffected.
+        """
+
+        self.decode_internal_eval_boundaries = bool(enabled)
+        self.decoder.internal_eval_boundaries = bool(enabled)
+
+    def set_decode_precision(self, precision: str) -> None:
+        """Select the decode activation precision for a default-off loader experiment.
+
+        ``"fp32"`` preserves the historical decode input dtype. ``"bf16"`` and ``"fp16"`` cast
+        decode latents before the post-quant convolution so lower-precision parameter-loading
+        routes also exercise matching decode activations.  This switch is intentionally independent
+        of encode/keyframe paths.
+        """
+
+        selected = str(precision).strip().lower()
+        if selected not in {"fp32", "bf16", "fp16"}:
+            raise ValueError(f"unknown VideoVAE decode precision {precision!r}; expected fp32, bf16, or fp16")
+        self.decode_precision = selected
 
     # -- tiling -----------------------------------------------------------------------------
 
@@ -547,7 +591,7 @@ class VideoVAE(nn.Module):
         return self._stitch_tiles(rows, [o // ratio for o in y_ov], [o // ratio for o in x_ov], 2, 3)
 
     def _decode_clip(self, z: mx.array) -> mx.array:
-        if not self.use_tiling:
+        if not self.use_tiling or not self.decode_spatial_tiling:
             return self.decoder(self.post_quant_conv(z))
         ratio = self.config.spatial_compression_ratio
         h, w = z.shape[2] * ratio, z.shape[3] * ratio
@@ -566,7 +610,8 @@ class VideoVAE(nn.Module):
                     :,
                 ]
                 decoded = self.decoder(self.post_quant_conv(tile))
-                mx.eval(decoded)
+                if self.decode_internal_eval_boundaries:
+                    mx.eval(decoded)
                 row.append(decoded)
             rows.append(row)
         return self._stitch_tiles(rows, y_ov, x_ov, 2, 3)
@@ -606,6 +651,10 @@ class VideoVAE(nn.Module):
         linearly cross-faded. Latent frames are repeated at the end when the length is not a whole
         number of chunks, and the extra pixel frames are cut off again.
         """
+        if self.decode_precision == "bf16":
+            z = z.astype(mx.bfloat16)
+        elif self.decode_precision == "fp16":
+            z = z.astype(mx.float16)
         z = z.transpose(0, 2, 3, 4, 1)  # -> (B, D, H, W, C)
         chunk_tokens = self.tokens_chunk_size
         token_drop = self.config.token_drop
@@ -658,4 +707,7 @@ class VideoVAE(nn.Module):
                 for k in range(pad_tokens)
             )
             out = out[:, :-pad_frames]
-        return out.transpose(0, 4, 1, 2, 3)
+        out = out.transpose(0, 4, 1, 2, 3)
+        if self.decode_precision in {"bf16", "fp16"}:
+            out = out.astype(mx.float32)
+        return out

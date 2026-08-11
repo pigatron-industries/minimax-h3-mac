@@ -59,6 +59,14 @@ def _safe_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _mlx_memory_snapshot() -> dict[str, int]:
+    return {
+        "active_bytes": int(mx.get_active_memory()),
+        "cache_bytes": int(mx.get_cache_memory()),
+        "peak_bytes": int(mx.get_peak_memory()),
+    }
+
+
 @dataclass
 class ForwardPassProfiler:
     """Collect wall-clock timings for an explicitly profiled generation run."""
@@ -82,6 +90,7 @@ class ForwardPassProfiler:
         do_sync = self.synchronize if synchronize is None else bool(synchronize)
         if do_sync:
             mx.synchronize()
+        memory_before = _mlx_memory_snapshot()
         started = _now_monotonic()
         ok = False
         try:
@@ -94,6 +103,7 @@ class ForwardPassProfiler:
             return out
         finally:
             elapsed = _now_monotonic() - started
+            memory_after = _mlx_memory_snapshot()
             self.events.append(
                 {
                     "label": str(label),
@@ -101,6 +111,9 @@ class ForwardPassProfiler:
                     "seconds": float(elapsed),
                     "ok": bool(ok),
                     "metadata": _safe_metadata(metadata),
+                    "memory_before": memory_before,
+                    "memory_after": memory_after,
+                    "active_memory_delta_bytes": memory_after["active_bytes"] - memory_before["active_bytes"],
                 }
             )
 
@@ -118,6 +131,7 @@ class ForwardPassProfiler:
         do_sync = self.synchronize if synchronize is None else bool(synchronize)
         if do_sync:
             mx.synchronize()
+        memory_before = _mlx_memory_snapshot()
         started = _now_monotonic()
         ok = False
         try:
@@ -127,6 +141,7 @@ class ForwardPassProfiler:
             ok = True
         finally:
             elapsed = _now_monotonic() - started
+            memory_after = _mlx_memory_snapshot()
             self.events.append(
                 {
                     "label": str(label),
@@ -134,6 +149,9 @@ class ForwardPassProfiler:
                     "seconds": float(elapsed),
                     "ok": bool(ok),
                     "metadata": _safe_metadata(metadata),
+                    "memory_before": memory_before,
+                    "memory_after": memory_after,
+                    "active_memory_delta_bytes": memory_after["active_bytes"] - memory_before["active_bytes"],
                 }
             )
 
@@ -154,16 +172,36 @@ class ForwardPassProfiler:
         for event in self.events:
             seconds = float(event.get("seconds") or 0.0)
             for table, key in ((by_category, str(event["category"])), (by_label, str(event["label"]))):
-                row = table.setdefault(key, {"count": 0, "total_seconds": 0.0, "samples": []})
+                row = table.setdefault(
+                    key,
+                    {
+                        "count": 0,
+                        "total_seconds": 0.0,
+                        "samples": [],
+                        "memory_samples": [],
+                    },
+                )
                 row["count"] += 1
                 row["total_seconds"] += seconds
                 row["samples"].append(seconds)
+                for snapshot_name in ("memory_before", "memory_after"):
+                    snapshot = event.get(snapshot_name)
+                    if isinstance(snapshot, dict):
+                        row["memory_samples"].append(snapshot)
 
         def finalize(table: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
             out: dict[str, dict[str, Any]] = {}
             for key, row in sorted(table.items()):
                 samples = [float(v) for v in row.pop("samples")]
+                memory_samples = row.pop("memory_samples")
                 total = float(row["total_seconds"])
+                memory_summary = {
+                    f"max_{counter}_observed": max(
+                        (int(sample[counter]) for sample in memory_samples if counter in sample),
+                        default=None,
+                    )
+                    for counter in ("active_bytes", "cache_bytes", "peak_bytes")
+                }
                 out[key] = {
                     "count": int(row["count"]),
                     "total_seconds": total,
@@ -171,6 +209,7 @@ class ForwardPassProfiler:
                     "median_seconds": float(statistics.median(samples)) if samples else None,
                     "min_seconds": float(min(samples)) if samples else None,
                     "max_seconds": float(max(samples)) if samples else None,
+                    **memory_summary,
                 }
             return out
 

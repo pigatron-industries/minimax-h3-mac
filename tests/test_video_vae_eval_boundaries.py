@@ -31,17 +31,6 @@ def config() -> VideoVAEConfig:
     )
 
 
-def without_internal_eval(fn):
-    original_eval = mx.eval
-    mx.eval = lambda *args, **kwargs: None
-    try:
-        output = fn()
-    finally:
-        mx.eval = original_eval
-    mx.eval(output)
-    return output
-
-
 def main() -> None:
     mx.random.seed(0)
     model = VideoVAE(config())
@@ -53,12 +42,19 @@ def main() -> None:
 
     eager_boundaries = model._decode_clip(latents)
     mx.eval(eager_boundaries)
-    lazy_graph = without_internal_eval(lambda: model._decode_clip(latents))
+    assert model.decode_internal_eval_boundaries is True
+    assert model.decoder.internal_eval_boundaries is True
+
+    model.set_decode_internal_eval_boundaries(False)
+    lazy_graph = model._decode_clip(latents)
+    mx.eval(lazy_graph)
 
     delta = float(mx.max(mx.abs(eager_boundaries - lazy_graph)).item())
     assert delta == 0.0, delta
     assert eager_boundaries.shape == (1, 2, 16, 16, 3)
-    print(f"video VAE eval boundaries exact: shape={eager_boundaries.shape}, delta={delta}")
+    assert model.decode_internal_eval_boundaries is False
+    assert model.decoder.internal_eval_boundaries is False
+    print(f"video VAE decode sync opt-in exact: shape={eager_boundaries.shape}, delta={delta}")
 
 
 if __name__ == "__main__":

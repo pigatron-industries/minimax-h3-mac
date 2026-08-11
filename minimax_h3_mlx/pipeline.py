@@ -140,6 +140,10 @@ class MiniMaxH3Pipeline:
         self._audio_config = getattr(audio_vae, "config", None)
         self._memory_pressure_guard = False
         self._memory_limit_gb = 16.0
+        self._video_vae_skip_decode_sync = False
+        self._video_vae_disable_decode_tiling = False
+        self._video_vae_decoder_quantization = "off"
+        self._video_vae_precision = "fp32"
 
     @classmethod
     def from_pretrained(
@@ -162,6 +166,10 @@ class MiniMaxH3Pipeline:
         dense_dequant_ffn_fc2_tile_size: int = 1024,
         dense_dequant_attention_out_tile_size: int = 2048,
         memory_pressure_guard: bool = False,
+        video_vae_skip_decode_sync: bool = False,
+        video_vae_disable_decode_tiling: bool = False,
+        video_vae_decoder_quantization: str = "off",
+        video_vae_precision: str = "fp32",
         verbose: bool = True,
     ) -> "MiniMaxH3Pipeline":
         """Load a released ``FL2VA/`` (or ``Ref2VA/``) directory.
@@ -214,6 +222,10 @@ class MiniMaxH3Pipeline:
             pipeline = cls(None, None, None, None, config)
             pipeline._memory_pressure_guard = bool(memory_pressure_guard)
             pipeline._memory_limit_gb = float(memory_limit_gb)
+            pipeline._video_vae_skip_decode_sync = bool(video_vae_skip_decode_sync)
+            pipeline._video_vae_disable_decode_tiling = bool(video_vae_disable_decode_tiling)
+            pipeline._video_vae_decoder_quantization = str(video_vae_decoder_quantization)
+            pipeline._video_vae_precision = str(video_vae_precision)
             pipeline._low_memory = True
             pipeline._checkpoint_root = root
             pipeline._dit_path = dit_path
@@ -263,11 +275,23 @@ class MiniMaxH3Pipeline:
         else:
             dit = step(f"transformer ({dit_path.name})", lambda: load_dit(dit_path))
             block_provider = None
-        video_vae = step("video vae", lambda: load_video_vae(root / "video_vae"))
+        video_vae = step(
+            "video vae",
+            lambda: load_video_vae(
+                root / "video_vae",
+                decoder_quantization=video_vae_decoder_quantization,
+                precision=video_vae_precision,
+            ),
+        )
         audio_vae = step("audio vae", lambda: load_audio_vae(root / "audio_vae"))
         pipeline = cls(dit, text_encoder, video_vae, audio_vae, config)
         pipeline._memory_pressure_guard = bool(memory_pressure_guard)
         pipeline._memory_limit_gb = float(memory_limit_gb)
+        pipeline._video_vae_skip_decode_sync = bool(video_vae_skip_decode_sync)
+        pipeline._video_vae_disable_decode_tiling = bool(video_vae_disable_decode_tiling)
+        pipeline._video_vae_decoder_quantization = str(video_vae_decoder_quantization)
+        pipeline._video_vae_precision = str(video_vae_precision)
+        pipeline._configure_video_vae_decode_options()
         pipeline._block_provider = block_provider
         pipeline._stream_block_group_size = stream_block_group_size
         pipeline.set_dense_dequant_profile(
@@ -311,6 +335,19 @@ class MiniMaxH3Pipeline:
                     ffn_fc2_tile_size=self._dense_dequant_ffn_fc2_tile_size,
                     attention_out_tile_size=self._dense_dequant_attention_out_tile_size,
                 )
+
+    def _configure_video_vae_decode_options(self) -> None:
+        """Apply default-off VideoVAE decode-only candidates to a loaded VAE."""
+        if self.video_vae is not None:
+            set_boundaries = getattr(self.video_vae, "set_decode_internal_eval_boundaries", None)
+            if set_boundaries is not None:
+                set_boundaries(not self._video_vae_skip_decode_sync)
+            set_decode_tiling = getattr(self.video_vae, "set_decode_spatial_tiling", None)
+            if set_decode_tiling is not None:
+                set_decode_tiling(not self._video_vae_disable_decode_tiling)
+            set_decode_precision = getattr(self.video_vae, "set_decode_precision", None)
+            if set_decode_precision is not None:
+                set_decode_precision(self._video_vae_precision)
 
     def _memory_guard_boundary(self) -> None:
         """Reassert optional allocator limits and drain reusable MLX/Metal buffers."""
@@ -681,9 +718,16 @@ class MiniMaxH3Pipeline:
             self.video_vae = profiled_call(
                 "load.video_vae_low_memory",
                 "load_overhead",
-                lambda: load_video_vae(self._checkpoint_root / "video_vae"),
+                lambda: load_video_vae(
+                    self._checkpoint_root / "video_vae",
+                    decoder_quantization=self._video_vae_decoder_quantization,
+                    precision=self._video_vae_precision,
+                ),
                 eval_output=False,
             )
+            self._configure_video_vae_decode_options()
+            if self._memory_pressure_guard:
+                self._memory_guard_boundary()
             video = profiled_call(
                 "pipeline.video_vae_decode",
                 "vae_decode",
@@ -731,6 +775,7 @@ class MiniMaxH3Pipeline:
     # -- decoding -----------------------------------------------------------------------------
 
     def _decode_video(self, rows, num_latent_frames, latent_height, latent_width) -> np.ndarray:
+        self._configure_video_vae_decode_options()
         cfg = self._video_config
         latents = unpatchify_video_tokens(
             rows, num_latent_frames, latent_height, latent_width, cfg.latent_channels, self._dit_config.patch_size

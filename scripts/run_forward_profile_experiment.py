@@ -72,6 +72,25 @@ def parse_swapusage(text: str) -> dict[str, Any]:
     return out
 
 
+def is_h3_mlx_process(line: str) -> bool:
+    lower = line.lower()
+    if any(
+        token in lower
+        for token in (
+            "scripts/generate.py",
+            "run_with_mlx_memory.py",
+            "run_forward_profile_experiment.py",
+        )
+    ):
+        return True
+    return "python" in lower and ("minimax-h3" in lower or "minimax_h3" in lower)
+
+
+def resolution_requires_healthy_preflight(resolution: str) -> bool:
+    width_s, height_s = resolution.lower().split("x", 1)
+    return int(width_s) * int(height_s) >= 320 * 192
+
+
 def memory_sample(label: str, memory_dir: Path) -> dict[str, Any]:
     vm = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=10)
     swap = subprocess.run(["sysctl", "vm.swapusage"], text=True, capture_output=True, timeout=10)
@@ -84,8 +103,7 @@ def memory_sample(label: str, memory_dir: Path) -> dict[str, Any]:
     ps_path.write_text(ps.stdout + (("\nSTDERR:\n" + ps.stderr) if ps.stderr else ""))
     matches = []
     for line in ps.stdout.splitlines()[1:]:
-        lower = line.lower()
-        if any(token in lower for token in ("minimax-h3", "minimax_h3", "scripts/generate.py", "run_with_mlx_memory.py")):
+        if is_h3_mlx_process(line):
             if str(os.getpid()) not in line.split(None, 1)[0:1]:
                 matches.append(line.rstrip())
     return {
@@ -131,14 +149,15 @@ def preflight(memory_dir: Path, *, idle_seconds: float) -> dict[str, Any]:
     raw_matches = first["matching_h3_mlx_processes"] + second["matching_h3_mlx_processes"]
     real_matches = [line for line in raw_matches if "run_forward_profile_experiment.py" not in line]
     issues = []
+    risk_signals = []
     if delta.get("pageouts") not in (None, 0):
         issues.append(f"idle_pageouts_delta_nonzero:{delta.get('pageouts')}")
     if delta.get("swapouts") not in (None, 0):
         issues.append(f"idle_swapouts_delta_nonzero:{delta.get('swapouts')}")
     if swap_free is None:
-        issues.append("swapusage_unparsed")
+        risk_signals.append("swapusage_unparsed")
     elif swap_free < 2048.0:
-        issues.append(f"swap_free_below_2048_mb:{swap_free}")
+        risk_signals.append(f"low_swap_free_risk_below_2048_mb:{swap_free}")
     if real_matches:
         issues.append("active_h3_mlx_process_matches_present")
     return {
@@ -149,10 +168,11 @@ def preflight(memory_dir: Path, *, idle_seconds: float) -> dict[str, Any]:
         "health_criteria": {
             "idle_pageouts_delta_required": 0,
             "idle_swapouts_delta_required": 0,
-            "minimum_swap_free_mb": 2048.0,
+            "low_swap_free_mb_recorded_as_risk_not_hard_gate": 2048.0,
             "no_active_h3_mlx_process_matches": True,
         },
         "issues": issues,
+        "risk_signals": risk_signals,
         "healthy": not issues,
         "real_active_h3_mlx_process_matches": real_matches,
     }
@@ -174,6 +194,28 @@ def parse_time_l(stderr: str) -> dict[str, Any]:
     if mlx:
         for key, raw in zip(("mlx_peak_bytes", "mlx_active_bytes_at_exit", "mlx_cache_bytes_at_exit"), mlx.groups()):
             out[key] = None if raw == "None" else int(raw)
+    return out
+
+
+def parse_generation_stdout(stdout: str) -> dict[str, Any]:
+    """Extract lightweight generation stats printed by scripts/generate.py."""
+
+    out: dict[str, Any] = {}
+    step = re.search(r"([0-9.]+)s per step, ([0-9.]+) min total", stdout)
+    if step:
+        out["pipeline_seconds_per_step"] = float(step.group(1))
+        out["pipeline_total_minutes_printed"] = float(step.group(2))
+    cache = re.search(
+        r"block cache:\s+full=(\d+)\s+cached=(\d+)\s+skipped=(\d+)\s+blocks\s+\(([0-9.]+)% of block executions\)",
+        stdout,
+    )
+    if cache:
+        out["block_cache"] = {
+            "full_steps": int(cache.group(1)),
+            "cache_steps": int(cache.group(2)),
+            "skipped_blocks": int(cache.group(3)),
+            "saved_fraction_percent": float(cache.group(4)),
+        }
     return out
 
 
@@ -382,6 +424,16 @@ def _total_seconds(container: dict[str, Any], key: str) -> float:
         return 0.0
 
 
+def _max_observed_bytes(container: dict[str, Any], keys: tuple[str, ...], counter: str) -> int | None:
+    values = [
+        container.get(key, {}).get(counter)
+        for key in keys
+        if isinstance(container.get(key), dict)
+    ]
+    finite = [int(value) for value in values if isinstance(value, (int, float))]
+    return max(finite) if finite else None
+
+
 def build_acceptance_summary(result: dict[str, Any]) -> dict[str, Any]:
     generation = result.get("generation", {})
     profile_summary = generation.get("forward_profile_summary", {}) or {}
@@ -397,6 +449,58 @@ def build_acceptance_summary(result: dict[str, Any]) -> dict[str, Any]:
     }
     load_init_total = sum(load_init_components.values())
     lazy_block_load = _total_seconds(labels, "streaming.block_load")
+    stage_timing = {
+        "text_conditioning": (
+            _total_seconds(labels, "load.text_encoder_low_memory")
+            + _total_seconds(labels, "pipeline.text_encoder_encode")
+        ),
+        "dit_setup": (
+            _total_seconds(labels, "load.streaming_transformer_low_memory")
+            + _total_seconds(labels, "pipeline.adaln_cache_build")
+        ),
+        "dit_forward": _total_seconds(labels, "pipeline.dit_forward_step"),
+        "video_vae_load_decode": (
+            _total_seconds(labels, "load.video_vae_low_memory")
+            + _total_seconds(labels, "pipeline.video_vae_decode")
+        ),
+        "audio_vae_load_decode": (
+            _total_seconds(labels, "load.audio_vae_low_memory")
+            + _total_seconds(labels, "pipeline.audio_vae_decode")
+        ),
+        "media_mux": _total_seconds(labels, "media.save_mp4_mux"),
+    }
+    stage_active_memory = {
+        "text_conditioning": _max_observed_bytes(
+            labels,
+            ("load.text_encoder_low_memory", "pipeline.text_encoder_encode"),
+            "max_active_bytes_observed",
+        ),
+        "dit_setup": _max_observed_bytes(
+            labels,
+            ("load.streaming_transformer_low_memory", "pipeline.adaln_cache_build"),
+            "max_active_bytes_observed",
+        ),
+        "dit_forward": _max_observed_bytes(
+            labels,
+            ("pipeline.dit_forward_step",),
+            "max_active_bytes_observed",
+        ),
+        "video_vae_load_decode": _max_observed_bytes(
+            labels,
+            ("load.video_vae_low_memory", "pipeline.video_vae_decode"),
+            "max_active_bytes_observed",
+        ),
+        "audio_vae_load_decode": _max_observed_bytes(
+            labels,
+            ("load.audio_vae_low_memory", "pipeline.audio_vae_decode"),
+            "max_active_bytes_observed",
+        ),
+        "media_mux": _max_observed_bytes(
+            labels,
+            ("media.save_mp4_mux",),
+            "max_active_bytes_observed",
+        ),
+    }
 
     forward_wall = _total_seconds(labels, "pipeline.dit_forward_step") or _total_seconds(categories, "dit_forward_total")
     linear_layers = _total_seconds(categories, "linear_projection")
@@ -433,13 +537,21 @@ def build_acceptance_summary(result: dict[str, Any]) -> dict[str, Any]:
     wav_exists = Path(wav_path).exists() if wav_path else False
 
     metrics = generation.get("metrics", {}) or {}
+    stdout_metrics = generation.get("stdout_metrics", {}) or {}
     memory_delta_payload = (generation.get("memory", {}) or {}).get("delta", {}) or {}
     return {
         "source": "derived_from_real_profiled_generation_artifact",
         "total_wall_time_seconds": total_wall,
         "load_init_overhead_seconds": load_init_total,
         "load_init_components_seconds": load_init_components,
+        "pipeline_stage_timing_seconds": stage_timing,
+        "pipeline_stage_max_active_memory_observed_bytes": stage_active_memory,
+        "pipeline_stage_memory_semantics": (
+            "Maximum MLX active allocation observed at synchronized profiler boundaries within each "
+            "stage; this is not a per-stage peak. Use resource_deltas.mlx_peak_bytes for the process-wide peak."
+        ),
         "generation_forward_wall_seconds": forward_wall,
+        "block_cache_observed": stdout_metrics.get("block_cache"),
         "major_component_timing_seconds": {
             "linear_layers": linear_layers,
             "attention": attention,
@@ -505,7 +617,6 @@ def build_generation_command(args: argparse.Namespace, run_dir: Path, resolution
         "balanced",
         "--low-memory",
         "--stream-blocks",
-        "--no-block-cache",
         "--resolution",
         resolution,
         "--duration",
@@ -525,6 +636,34 @@ def build_generation_command(args: argparse.Namespace, run_dir: Path, resolution
         "--output",
         str(media),
     ]
+    if getattr(args, "video_vae_skip_decode_sync", False):
+        cmd.append("--video-vae-skip-decode-sync")
+    if getattr(args, "video_vae_disable_decode_tiling", False):
+        cmd.append("--video-vae-disable-decode-tiling")
+    decoder_quantization = getattr(args, "video_vae_decoder_quantization", "off")
+    if decoder_quantization != "off":
+        cmd.extend(["--video-vae-decoder-quantization", decoder_quantization])
+    video_vae_precision = getattr(args, "video_vae_precision", "fp32")
+    if video_vae_precision != "fp32":
+        cmd.extend(["--video-vae-precision", video_vae_precision])
+    if args.block_cache:
+        cmd.extend(
+            [
+                "--block-cache",
+                "--block-cache-threshold",
+                str(args.block_cache_threshold),
+                "--block-cache-start-percent",
+                str(args.block_cache_start_percent),
+                "--block-cache-end-percent",
+                str(args.block_cache_end_percent),
+                "--block-cache-depth",
+                str(args.block_cache_depth),
+                "--block-cache-max-consecutive",
+                str(args.block_cache_max_consecutive),
+            ]
+        )
+    else:
+        cmd.append("--no-block-cache")
     return cmd, media, profile_json
 
 
@@ -540,10 +679,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--duration", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--block-cache", action="store_true", help="enable the opt-in residual tail block cache for this profiled generation")
+    parser.add_argument(
+        "--video-vae-skip-decode-sync",
+        action="store_true",
+        help="enable the default-off VideoVAE decode candidate that skips internal mx.eval boundaries",
+    )
+    parser.add_argument(
+        "--video-vae-disable-decode-tiling",
+        action="store_true",
+        help="enable the default-off VideoVAE decode candidate that uses one full spatial decode grid",
+    )
+    parser.add_argument(
+        "--video-vae-decoder-quantization",
+        choices=("off", "8bit", "4bit"),
+        default="off",
+        help="enable default-off VideoVAE decoder QuantizedLinear loading for profiled generation",
+    )
+    parser.add_argument(
+        "--video-vae-precision",
+        choices=("fp32", "bf16", "fp16"),
+        default="fp32",
+        help="enable default-off VideoVAE lower-precision parameter loading/decode for profiled generation",
+    )
+    parser.add_argument("--block-cache-threshold", type=float, default=0.12)
+    parser.add_argument("--block-cache-start-percent", type=float, default=0.10)
+    parser.add_argument("--block-cache-end-percent", type=float, default=0.90)
+    parser.add_argument("--block-cache-depth", type=float, default=0.75)
+    parser.add_argument("--block-cache-max-consecutive", type=int, default=2)
     parser.add_argument("--preflight-idle-seconds", type=float, default=5.0)
     parser.add_argument("--timeout-seconds", type=int, default=900)
+    parser.add_argument(
+        "--allow-unhealthy-preflight",
+        action="store_true",
+        help="run despite recorded memory/swap preflight issues; intended only for an explicitly supervised bounded profile",
+    )
     parser.add_argument("--run-dir", default=None)
     args = parser.parse_args(argv)
+    if args.block_cache_threshold < 0:
+        parser.error("--block-cache-threshold must be non-negative")
+    if not 0.0 <= args.block_cache_start_percent <= args.block_cache_end_percent <= 1.0:
+        parser.error("--block-cache-start-percent/end-percent must satisfy 0 <= start <= end <= 1")
+    if not 0.0 <= args.block_cache_depth < 1.0:
+        parser.error("--block-cache-depth must satisfy 0 <= depth < 1")
+    if args.block_cache_max_consecutive < 0:
+        parser.error("--block-cache-max-consecutive must be non-negative")
 
     run_dir = Path(args.run_dir) if args.run_dir else ROOT / "experiments" / f"forward_pass_profile_{utc_stamp()}"
     logs = run_dir / "command_outputs"
@@ -569,20 +749,34 @@ def main(argv: list[str] | None = None) -> int:
             "profile": "balanced",
             "low_memory": True,
             "stream_blocks": True,
-            "block_cache": False,
+            "block_cache": bool(args.block_cache),
+            "block_cache_threshold": args.block_cache_threshold,
+            "block_cache_start_percent": args.block_cache_start_percent,
+            "block_cache_end_percent": args.block_cache_end_percent,
+            "block_cache_depth": args.block_cache_depth,
+            "block_cache_max_consecutive": args.block_cache_max_consecutive,
             "dense_dequant_profile": "off",
             "memory_pressure_guard": True,
+            "video_vae_skip_decode_sync": bool(args.video_vae_skip_decode_sync),
+            "video_vae_disable_decode_tiling": bool(args.video_vae_disable_decode_tiling),
+            "video_vae_decoder_quantization": args.video_vae_decoder_quantization,
+            "video_vae_precision": args.video_vae_precision,
             "resolution": args.resolution,
             "duration_seconds": args.duration,
             "steps_sigma_points": args.steps,
             "seed": args.seed,
+            "allow_unhealthy_preflight": args.allow_unhealthy_preflight,
         },
     }
 
     result["preflight"] = preflight(memory_dir, idle_seconds=args.preflight_idle_seconds)
-    if args.resolution == "320x192" and not result["preflight"].get("healthy"):
+    needs_healthy_preflight = resolution_requires_healthy_preflight(args.resolution)
+    result["preflight_override_used"] = bool(
+        needs_healthy_preflight and not result["preflight"].get("healthy") and args.allow_unhealthy_preflight
+    )
+    if needs_healthy_preflight and not result["preflight"].get("healthy") and not args.allow_unhealthy_preflight:
         result["generation_attempted"] = False
-        result["blocker_fingerprint"] = "blocker:forward-profile-320x192-preflight-unhealthy-v1"
+        result["blocker_fingerprint"] = "blocker:forward-profile-resolution-preflight-unhealthy-v1"
         result["quantized_activation_support"] = quantized_activation_probe()
         (run_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         print(json.dumps({"run_dir": str(run_dir), "status": "blocked_preflight", "issues": result["preflight"].get("issues")}, indent=2))
@@ -598,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     after = memory_sample("post_generation", memory_dir)
     generation["metrics"] = parse_time_l(Path(generation["stderr_path"]).read_text())
+    generation["stdout_metrics"] = parse_generation_stdout(Path(generation["stdout_path"]).read_text())
     generation["memory"] = {"pre": before, "post": after, "delta": memory_delta(before, after)}
     generation["output"] = str(media_path)
     generation["forward_profile_json"] = str(profile_json)

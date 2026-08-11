@@ -99,7 +99,17 @@ def main() -> None:
         assert pipe._audio_config.latent_channels == 32
         assert pipe._dit_config.num_layers == 2
         assert pipe._block_load_mode == "mlx"
-        print("low-memory init holds metadata only")
+
+    pipeline_source = (ROOT / "minimax_h3_mlx" / "pipeline.py").read_text()
+    lowmem_video_load = pipeline_source.index('"load.video_vae_low_memory"')
+    configure_decode = pipeline_source.index("self._configure_video_vae_decode_options()", lowmem_video_load)
+    guarded_drain = pipeline_source.index(
+        "if self._memory_pressure_guard:\n                self._memory_guard_boundary()",
+        configure_decode,
+    )
+    video_decode = pipeline_source.index('"pipeline.video_vae_decode"', guarded_drain)
+    assert lowmem_video_load < configure_decode < guarded_drain < video_decode
+    print("low-memory init holds metadata only; guarded VideoVAE load/decode drain is ordered")
 
 
 if __name__ == "__main__":
