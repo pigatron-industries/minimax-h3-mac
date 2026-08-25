@@ -7,16 +7,19 @@ import tempfile
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import transformers
+from PIL import Image
 from mlx.utils import tree_flatten
-from mlx_vlm.models.qwen3_vl.config import TextConfig
+from mlx_vlm.models.qwen3_vl.config import TextConfig, VisionConfig
 from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
+from mlx_vlm.models.qwen3_vl.vision import VisionModel
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from minimax_h3_mlx.config import TAG_TEXT
+from minimax_h3_mlx.config import TAG_TEXT, TAG_VIDEO
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 from quantize_text_encoder import convert
 
@@ -39,6 +42,23 @@ def config() -> TextConfig:
             "mrope_section": [4, 2, 2],
             "mrope_interleaved": True,
         },
+    )
+
+
+def vision_config() -> VisionConfig:
+    return VisionConfig(
+        model_type="qwen3_vl",
+        depth=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=2,
+        in_channels=3,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        out_hidden_size=64,
+        num_position_embeddings=64,
+        deepstack_visual_indexes=[0],
     )
 
 
@@ -99,10 +119,48 @@ def write_source(root: Path, model: Qwen3VLModel) -> None:
     (root / "config.json").write_text(json.dumps(raw))
 
 
+def write_visual_checkpoint(root: Path, model: VisionModel) -> None:
+    state = {}
+    for key, value in tree_flatten(model.parameters()):
+        # Exercise the same PyTorch Conv3d layout that the released sidecar stores; the MLX
+        # VisionModel.sanitize path must transpose it back before update.
+        if key == "patch_embed.proj.weight":
+            value = value.transpose(0, 4, 1, 2, 3)
+        state[f"model.visual.{key}"] = value
+    mx.save_safetensors(str(root / "visual.safetensors"), state)
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {key: "visual.safetensors" for key in state},
+    }))
+
+
+def write_processor(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "preprocessor_config.json").write_text(json.dumps({
+        "size": {"shortest_edge": 65536, "longest_edge": 16777216},
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+        "image_mean": [0.5, 0.5, 0.5],
+        "image_std": [0.5, 0.5, 0.5],
+    }))
+
+
+def add_visual_to_resident_checkpoint(output: Path, visual_root: Path) -> None:
+    # Use the exact same visual values as the source sidecar, rather than a fresh random module.
+    index = json.loads((output / "model.safetensors.index.json").read_text())
+    visual_index = json.loads((visual_root / "model.safetensors.index.json").read_text())["weight_map"]
+    visual_arrays = mx.load(str(visual_root / "visual.safetensors"))
+    mx.save_safetensors(str(output / "visual.safetensors"), visual_arrays)
+    index["weight_map"].update({key: "visual.safetensors" for key in visual_index})
+    (output / "model.safetensors.index.json").write_text(json.dumps(index))
+
+
 def main() -> None:
     mx.random.seed(0)
     source_model = Qwen3VLModel(config())
+    source_vision = VisionModel(vision_config())
     mx.eval(source_model.parameters())
+    mx.eval(source_vision.parameters())
     input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
     expected = source_model(input_ids)
     mx.eval(expected)
@@ -110,10 +168,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source, output = root / "source", root / "output"
+        visual_root = root / "visual-source"
+        processor_root = root / "processor"
         tokenizer_assets = root / "tokenizer-assets"
         source.mkdir()
+        visual_root.mkdir()
         tokenizer_assets.mkdir()
         write_source(source, source_model)
+        write_visual_checkpoint(visual_root, source_vision)
         convert(source, output, num_layers=1)
         original_quantize = mx.quantize
         mx.quantize = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -125,6 +187,8 @@ def main() -> None:
             mx.quantize = original_quantize
         actual = encoder.language(input_ids)
         mx.eval(actual)
+        add_visual_to_resident_checkpoint(output, visual_root)
+        write_processor(processor_root)
 
         seen_tokenizer_paths: list[Path] = []
 
@@ -133,9 +197,19 @@ def main() -> None:
                 return 256
 
             def __call__(self, prompt, add_special_tokens=False):
-                assert prompt == "real prompt"
                 assert add_special_tokens is False
-                return {"input_ids": [5, 7, 11]}
+                if prompt == "real prompt":
+                    return {"input_ids": [5, 7, 11]}
+                if prompt.startswith("<Picture "):
+                    return {"input_ids": [12, 13]}
+                raise AssertionError(f"unexpected tokenizer input: {prompt!r}")
+
+            def convert_tokens_to_ids(self, token):
+                return {
+                    "<|vision_start|>": 203,
+                    "<|image_pad|>": 201,
+                    "<|vision_end|>": 204,
+                }[token]
 
         class FakeAutoTokenizer:
             @classmethod
@@ -183,20 +257,113 @@ def main() -> None:
         else:
             raise AssertionError("empty tokenization must fail before QuantizedEmbedding")
 
-    assert actual.shape == expected.shape
-    assert actual.dtype == expected.dtype
-    relative_l2 = float(
-        mx.sqrt(mx.sum((actual - expected) ** 2))
-        / mx.maximum(mx.sqrt(mx.sum(expected**2)), mx.array(1e-12))
-    )
-    assert relative_l2 < 0.5, relative_l2
-    packed = [value for key, value in tree_flatten(encoder.language.parameters()) if key.endswith("weight")]
-    assert any(value.dtype == mx.uint32 for value in packed)
-    assert seen_tokenizer_paths == [tokenizer_assets]
-    assert routed_ids.shape == (1, 3)
-    assert routed_tags.tolist() == [TAG_TEXT, TAG_TEXT, TAG_TEXT]
-    assert "has only 1 tokens" in incomplete_error
-    assert "no input token IDs" in empty_error
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        relative_l2 = float(
+            mx.sqrt(mx.sum((actual - expected) ** 2))
+            / mx.maximum(mx.sqrt(mx.sum(expected**2)), mx.array(1e-12))
+        )
+        assert relative_l2 < 0.5, relative_l2
+        packed = [value for key, value in tree_flatten(encoder.language.parameters()) if key.endswith("weight")]
+        assert any(value.dtype == mx.uint32 for value in packed)
+        assert seen_tokenizer_paths == [tokenizer_assets]
+        assert routed_ids.shape == (1, 3)
+        assert routed_tags.tolist() == [TAG_TEXT, TAG_TEXT, TAG_TEXT]
+        assert "has only 1 tokens" in incomplete_error
+        assert "no input token IDs" in empty_error
+
+        # A real tiny visual tower exercises native preprocessing, indexed token replacement,
+        # M-RoPE and one deep-stack merge in both resident and streamed quantized language modes.
+        resident = MiniMaxH3TextEncoder(
+            output,
+            num_layers=1,
+            dtype=mx.bfloat16,
+            load_vision=True,
+            tokenizer_dir=tokenizer_assets,
+            processor_dir=processor_root,
+        )
+        streamed = MiniMaxH3TextEncoder(
+            output,
+            num_layers=1,
+            dtype=mx.bfloat16,
+            load_vision=True,
+            tokenizer_dir=tokenizer_assets,
+            processor_dir=processor_root,
+            stream_layers=True,
+            vision_model_dir=visual_root,
+        )
+        fake_tokenizer = FakeTokenizer()
+        resident._tokenizer = fake_tokenizer
+        streamed._tokenizer = fake_tokenizer
+        image = Image.new("RGB", (320, 288), (32, 96, 160))
+        pixel_values, image_grid = streamed.build_request("real prompt", [image])[2]
+        assert pixel_values.shape == (360, 1536), pixel_values.shape
+        assert image_grid.tolist() == [[1, 18, 20]], image_grid
+        resident_hidden, resident_tags = resident.encode("real prompt", [image])
+        streamed_hidden, streamed_tags = streamed.encode("real prompt", [image])
+        assert resident_hidden.shape == streamed_hidden.shape
+        assert resident_tags.tolist() == streamed_tags.tolist()
+        assert resident_tags.tolist().count(TAG_VIDEO) == 92  # start + 90 pads + end
+        visual_delta = float(
+            np.abs(
+                np.array(resident_hidden.astype(mx.float32))
+                - np.array(streamed_hidden.astype(mx.float32))
+            ).max()
+        )
+        assert visual_delta <= 1e-5, visual_delta
+
+        # Text-only streaming remains independent of the visual sidecar.
+        text_only = MiniMaxH3TextEncoder(
+            output,
+            num_layers=1,
+            load_vision=False,
+            tokenizer_dir=tokenizer_assets,
+            stream_layers=True,
+            vision_model_dir=root / "does-not-exist",
+        )
+        text_only._tokenizer = fake_tokenizer
+        text_ids, text_tags, text_vision = text_only.build_request("real prompt")
+        assert text_ids.shape == (1, 3)
+        assert text_tags.tolist() == [TAG_TEXT] * 3
+        assert text_vision is None
+
+        try:
+            MiniMaxH3TextEncoder(
+                output,
+                num_layers=1,
+                load_vision=True,
+                processor_dir=processor_root,
+                stream_layers=True,
+            )
+        except ValueError as exc:
+            assert "vision_model_dir" in str(exc)
+        else:
+            raise AssertionError("streamed vision without vision_model_dir must fail")
+
+        mismatch = MiniMaxH3TextEncoder(
+            output,
+            num_layers=1,
+            dtype=mx.bfloat16,
+            load_vision=True,
+            tokenizer_dir=tokenizer_assets,
+            processor_dir=processor_root,
+            stream_layers=True,
+            vision_model_dir=visual_root,
+        )
+        mismatch._tokenizer = fake_tokenizer
+
+        class BadVision:
+            def __call__(self, pixel_values, image_grid_thw, **kwargs):
+                return mx.zeros((2, 64)), [mx.zeros((2, 64))]
+
+        mismatch.vision = BadVision()
+        try:
+            mismatch.encode("real prompt", [Image.new("RGB", (32, 32), (0, 0, 0))])
+        except ValueError as exc:
+            assert "visual rows/image-pad mismatch" in str(exc)
+        else:
+            raise AssertionError("visual/image-pad mismatch must fail closed")
+
     print(f"quantized text forward: shape={actual.shape}, relative_l2={relative_l2:.4f}")
 
 

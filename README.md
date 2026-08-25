@@ -376,9 +376,41 @@ caffeinate -dimsu .venv/bin/python scripts/generate.py \
 
 `--steps 9` 对应 8 次 DiT forward。原生 MLX Turbo 已记录每个组件的 rank/alpha，因此**不要传** `--turbo-lora-alpha`；运行时保持 BF16 LoRA 更新与 INT8 基座分离。
 
+### 低内存图生视频（FL2VA）
+
+首帧图生视频沿用同一套低内存参数，只需增加一组 `--image` / `--anchor`：
+
+```bash
+caffeinate -dimsu .venv/bin/python scripts/generate.py \
+  "Subtle natural motion, coherent details, smooth cinematic camera movement" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --text-encoder models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --turbo-lora models/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --profile quality \
+  --low-memory \
+  --stream-blocks \
+  --image input.png \
+  --anchor first \
+  --duration 5 \
+  --steps 9 \
+  --memory-pressure-guard \
+  --no-block-cache \
+  --output out/i2v-first-frame.mp4
+```
+
+`--anchor last` 表示只约束尾帧。首尾双帧时按顺序重复参数：
+
+```bash
+--image first.png --anchor first \
+--image last.png  --anchor last
+```
+
+不传 `--resolution` 时，画布由第一张关键帧的宽高比决定。低内存路径依次完成视觉文本编码、关键帧 Video VAE 编码和流式 DiT，并在阶段之间释放模型。`--text-encoder` 目录只替换量化后的语言权重；图生视频所需的 Qwen 视觉塔仍从 `--checkpoint` 下的 `text_encoder` 读取，因此两者必须来自同一个 FL2VA 版本。
+
 ## 4. 24GB M4 Pro 实测结果
 
-上述命令已在同一台 24GB M4 Pro MacBook Pro 上端到端跑通：
+本节 `## 3` 中不带 `--image` 的 T2V 命令已在同一台 24GB M4 Pro MacBook Pro 上端到端跑通；下表不是对上方 I2V 示例的性能声明：
 
 | 项目 | 实测结果 |
 |---|---:|

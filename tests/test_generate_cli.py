@@ -169,6 +169,93 @@ def test_resolution_parses_validates_and_conflicts_with_legacy_surface() -> None
     )
 
 
+def test_repeatable_keyframes_require_one_anchor_each() -> None:
+    module = load_generate()
+    args = module.parse_args(
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--image",
+            "first.png",
+            "--anchor",
+            "first",
+            "--image",
+            "last.png",
+            "--anchor",
+            "last",
+        ],
+        env={},
+    )
+    assert_case("repeatable images preserve order", args.image == ["first.png", "last.png"])
+    assert_case("repeatable anchors preserve order", args.anchor == ["first", "last"])
+    assert_parse_error(
+        module,
+        ["a safe prompt", "--checkpoint", "models/upstream", "--image", "first.png"],
+        env={},
+    )
+    assert_parse_error(
+        module,
+        ["a safe prompt", "--checkpoint", "models/upstream", "--anchor", "first"],
+        env={},
+    )
+    assert_parse_error(
+        module,
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--image",
+            "one.png",
+            "--anchor",
+            "first",
+            "--image",
+            "two.png",
+            "--anchor",
+            "last",
+            "--image",
+            "three.png",
+            "--anchor",
+            "last",
+        ],
+        env={},
+    )
+    assert_parse_error(
+        module,
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--image",
+            "first.png",
+            "--anchor",
+            "first",
+            "--image",
+            "last.png",
+            "--anchor",
+            "first",
+        ],
+        env={},
+    )
+    assert_parse_error(
+        module,
+        [
+            "a safe prompt",
+            "--checkpoint",
+            "models/upstream",
+            "--image",
+            "last.png",
+            "--anchor",
+            "last",
+            "--image",
+            "first.png",
+            "--anchor",
+            "first",
+        ],
+        env={},
+    )
+
+
 def test_generation_cli_exposes_no_macsol_deployable_surface() -> None:
     module = load_generate()
     parser = module.build_parser()
@@ -217,6 +304,7 @@ def main() -> int:
     test_missing_checkpoint_has_no_local_absolute_default()
     test_profile_presets_parse_and_explicit_flags_win()
     test_resolution_parses_validates_and_conflicts_with_legacy_surface()
+    test_repeatable_keyframes_require_one_anchor_each()
     test_generation_cli_exposes_no_macsol_deployable_surface()
     test_legacy_width_height_and_steps_semantics_are_preserved()
     return 0

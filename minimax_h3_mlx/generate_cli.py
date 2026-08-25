@@ -374,8 +374,20 @@ def parse_args(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | No
         if args.width is not None or args.height is not None:
             parser.error("--resolution cannot be combined with --width or --height; use one canvas override surface")
         args.width, args.height = args.resolution
-    if args.image and len(args.anchor or ()) != len(args.image):
-        parser.error(f"--anchor must be given once per --image ({len(args.image)} images, {len(args.anchor or ())} anchors)")
+    image_count = len(args.image or ())
+    anchor_count = len(args.anchor or ())
+    if anchor_count != image_count:
+        parser.error(
+            f"--anchor must be given once per --image ({image_count} images, "
+            f"{anchor_count} anchors)"
+        )
+    anchors = tuple(args.anchor or ())
+    if image_count > 2:
+        parser.error(f"MiniMax-H3 accepts at most two keyframe images, got {image_count}")
+    if image_count == 1 and anchors not in (("first",), ("last",)):
+        parser.error("one --image requires --anchor first or --anchor last")
+    if image_count == 2 and anchors != ("first", "last"):
+        parser.error("two --image values require --anchor first followed by --anchor last")
     for name in ("width", "height"):
         value = getattr(args, name)
         if value is not None:

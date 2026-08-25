@@ -46,12 +46,14 @@ class MiniMaxH3TextEncoder:
         tokenizer_dir: str | Path | None = None,
         processor_dir: str | Path | None = None,
         stream_layers: bool = False,
+        vision_model_dir: str | Path | None = None,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
         from mlx_vlm.models.qwen3_vl.language import Qwen3VLDecoderLayer, Qwen3VLModel
         from mlx_vlm.models.qwen3_vl.vision import VisionModel
 
         model_dir = Path(model_dir)
+        vision_model_dir = None if vision_model_dir is None else Path(vision_model_dir)
         with open(model_dir / "config.json") as fh:
             raw = json.load(fh)
 
@@ -64,8 +66,11 @@ class MiniMaxH3TextEncoder:
                 "layers is post-norm and is not the conditioning MiniMax-H3 expects."
             )
 
-        if stream_layers and load_vision:
-            raise ValueError("streamed text-encoder loading currently supports text-only requests")
+        if stream_layers and load_vision and vision_model_dir is None:
+            raise ValueError(
+                "vision_model_dir is required when stream_layers=True and load_vision=True; "
+                "it must point to the indexed source checkpoint owning model.visual.* tensors."
+            )
 
         self.num_layers = num_layers
         self.full_layers = full_layers
@@ -131,6 +136,8 @@ class MiniMaxH3TextEncoder:
                 or any(key.startswith(f"model.language_model.layers.{i}.") for i in range(num_layers))
                 for key in self._weight_map
             )
+            if self.vision is not None:
+                self._load_stream_vision(vision_model_dir)
             if verbose:
                 precision = "quantized" if self.quantized else "full-precision"
                 print(f"  text encoder: {precision} weights, streaming {num_layers} layers")
@@ -139,12 +146,13 @@ class MiniMaxH3TextEncoder:
             self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
+        self.video_token_id = raw["video_token_id"]
         self.vision_start_token_id = raw["vision_start_token_id"]
         self.vision_end_token_id = raw["vision_end_token_id"]
         self.merge_size = self.vision_config.spatial_merge_size
 
         self._tokenizer = None
-        self._processor = None
+        self._image_processor = None
         self._model_dir = model_dir
         root = model_dir.parent
         self._tokenizer_dir = (
@@ -213,8 +221,11 @@ class MiniMaxH3TextEncoder:
             for bucket, module in (("language", self.language), ("vision", self.vision)):
                 if module is None or not updates[bucket]:
                     continue
-                module.update(tree_unflatten(updates[bucket]))
-                mx.eval(*(tensor for _, tensor in updates[bucket]))
+                update_items = updates[bucket]
+                if bucket == "vision":
+                    update_items = list(self.vision.sanitize(dict(update_items)).items())
+                module.update(tree_unflatten(update_items))
+                mx.eval(*(tensor for _, tensor in update_items))
             if verbose:
                 print(f"  {Path(shard).name}: {loaded} tensors loaded")
 
@@ -225,6 +236,50 @@ class MiniMaxH3TextEncoder:
                     f"{bucket} encoder missing {len(missing)} tensors, e.g. {missing[:4]}."
                 )
         self.skipped_tensors = skipped
+
+    def _load_stream_vision(self, vision_model_dir: Path | None) -> None:
+        """Load exactly the visual tensors from the indexed upstream source checkpoint."""
+
+        from mlx.utils import tree_flatten, tree_unflatten
+
+        from .selective_loading import load_selected_mlx_tensors, load_weight_map
+
+        if vision_model_dir is None:
+            # The constructor checks this combination before constructing the module. Keep the
+            # guard here as well so this helper cannot ever silently choose the language directory.
+            raise ValueError("vision_model_dir is required for streamed vision loading")
+        index_path = vision_model_dir / "model.safetensors.index.json"
+        if not index_path.is_file():
+            raise FileNotFoundError(f"visual checkpoint index not found at {index_path}")
+
+        indexed = load_weight_map(vision_model_dir)
+        prefix = "model.visual."
+        selected = {key[len(prefix) :] for key in indexed if key.startswith(prefix)}
+        expected = {key for key, _ in tree_flatten(self.vision.parameters())}
+        missing = sorted(expected - selected)
+        unexpected = sorted(selected - expected)
+        if missing or unexpected:
+            raise KeyError(
+                f"visual tensor set mismatch in vision_model_dir={vision_model_dir}: "
+                f"expected {len(expected)}, selected {len(selected)}, missing {len(missing)} "
+                f"{missing[:4]}, unexpected {len(unexpected)} {unexpected[:4]}"
+            )
+
+        source_keys = [prefix + key for key in sorted(expected)]
+        loaded = load_selected_mlx_tensors(vision_model_dir, source_keys)
+        stripped = {key[len(prefix) :]: value for key, value in loaded.items()}
+        sanitized = self.vision.sanitize(stripped)
+        sanitized_keys = set(sanitized)
+        if sanitized_keys != expected:
+            missing_after = sorted(expected - sanitized_keys)
+            unexpected_after = sorted(sanitized_keys - expected)
+            raise KeyError(
+                f"sanitized visual tensor set mismatch in vision_model_dir={vision_model_dir}: "
+                f"expected {len(expected)}, got {len(sanitized_keys)}, missing {missing_after[:4]}, "
+                f"unexpected {unexpected_after[:4]}"
+            )
+        self.vision.update(tree_unflatten(sorted(sanitized.items())))
+        mx.eval(self.vision.parameters())
 
     # -- tokenizer / processor -------------------------------------------------------------
 
@@ -249,12 +304,17 @@ class MiniMaxH3TextEncoder:
         return self._tokenizer
 
     @property
-    def processor(self):
-        if self._processor is None:
-            from transformers import AutoProcessor
+    def image_processor(self):
+        """Load the image-only Qwen2-VL processor without its torch-backed video sibling."""
 
-            self._processor = AutoProcessor.from_pretrained(str(self._processor_dir))
-        return self._processor
+        if self._image_processor is None:
+            try:
+                from transformers.models.qwen2_vl import Qwen2VLImageProcessorPil as ImageProcessor
+            except ImportError:  # transformers 4.x exposes the same NumPy/Pillow path without the suffix.
+                from transformers.models.qwen2_vl import Qwen2VLImageProcessor as ImageProcessor
+
+            self._image_processor = ImageProcessor.from_pretrained(str(self._processor_dir))
+        return self._image_processor
 
     # -- request presentation --------------------------------------------------------------
 
@@ -272,10 +332,25 @@ class MiniMaxH3TextEncoder:
         vision_inputs = None
 
         if images:
-            vision = self.processor.image_processor(images=images, return_tensors="np")
+            vision = self.image_processor(images=images, return_tensors="np")
             pixel_values = np.asarray(vision["pixel_values"])
             grid_thw = np.asarray(vision["image_grid_thw"])
-            merge = self.processor.image_processor.merge_size**2
+            merge = self.image_processor.merge_size**2
+            expected_rows = 0
+            for index in range(len(images)):
+                grid = np.asarray(grid_thw[index], dtype=np.int64)
+                patch_rows = int(np.prod(grid))
+                if patch_rows % merge:
+                    raise ValueError(
+                        f"image[{index}] grid rows are not divisible by merge area: "
+                        f"observed {patch_rows}, expected a multiple of {merge}"
+                    )
+                expected_rows += patch_rows
+            if pixel_values.shape[0] != expected_rows:
+                raise ValueError(
+                    f"visual rows/image-grid mismatch: observed {pixel_values.shape[0]} visual rows, "
+                    f"expected {expected_rows} from image_grid_thw"
+                )
             start = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
             pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
             end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -357,13 +432,55 @@ class MiniMaxH3TextEncoder:
         inputs_embeds: mx.array | None = None,
         visual_pos_masks: mx.array | None = None,
         deepstack_visual_embeds: list | None = None,
+        visual_embeds: mx.array | None = None,
     ) -> mx.array:
         """Run the truncated stack and return the hidden state **before** the final norm."""
         from mlx_vlm.models.base import create_attention_mask
 
+        visual_positions = None
+        if self.stream_layers and visual_pos_masks is not None:
+            if visual_pos_masks.ndim != 2 or visual_pos_masks.shape[0] != 1:
+                raise ValueError(
+                    "streamed text encoding accepts exactly one request at a time; "
+                    f"got visual mask shape {visual_pos_masks.shape}"
+                )
+            mask_np = np.asarray(visual_pos_masks[0], dtype=bool)
+            visual_positions = mx.array(np.flatnonzero(mask_np), dtype=mx.uint32)
+            if visual_embeds is not None and visual_embeds.shape[0] != len(visual_positions):
+                raise ValueError(
+                    f"visual rows/image-pad mismatch: observed {visual_embeds.shape[0]} visual rows, "
+                    f"expected {len(visual_positions)} image-pad positions"
+                )
+
+        def replace_visual_rows(hidden: mx.array, values: mx.array | None) -> mx.array:
+            if values is None:
+                return hidden
+            if visual_pos_masks is None:
+                raise ValueError("visual embeddings were supplied without image-pad positions")
+            from mlx_vlm.models.qwen3_vl.qwen3_vl import Model
+
+            merged, _ = Model.merge_input_ids_with_image_features(
+                values.astype(hidden.dtype),
+                hidden,
+                input_ids,
+                self.image_token_id,
+                self.video_token_id,
+            )
+            return merged
+
+        def add_deepstack_rows(hidden: mx.array, values: mx.array) -> mx.array:
+            if visual_positions is None:
+                raise ValueError("deep-stack visual embeddings were supplied without image-pad positions")
+            if values.shape[0] != len(visual_positions):
+                raise ValueError(
+                    f"deep-stack visual rows/image-pad mismatch: observed {values.shape[0]} rows, "
+                    f"expected {len(visual_positions)} image-pad positions"
+                )
+            row = hidden[0]
+            row = row.at[visual_positions].add(values.astype(row.dtype))
+            return mx.expand_dims(row, axis=0)
+
         if self.stream_layers:
-            if inputs_embeds is not None or deepstack_visual_embeds is not None:
-                raise ValueError("streamed text encoder does not support vision embeddings")
             embedding_key = "model.language_model.embed_tokens.weight"
             embedding = self._load_stream_tensor(embedding_key)
             if self.quantized:
@@ -393,6 +510,7 @@ class MiniMaxH3TextEncoder:
             if clear_cache is not None:
                 clear_cache()
             mask = create_attention_mask(h, None)
+            h = replace_visual_rows(h, visual_embeds)
             layer = self._stream_layer
             position_embeddings = None
             if position_ids is not None and not layer.self_attn.rotary_emb.fused_apply:
@@ -400,6 +518,8 @@ class MiniMaxH3TextEncoder:
             for layer_idx in range(self.num_layers):
                 self._load_stream_layer(layer_idx)
                 h = layer(h, mask, None, position_ids, position_embeddings)
+                if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                    h = add_deepstack_rows(h, deepstack_visual_embeds[layer_idx])
                 # Materialize before replacing this slot with the next layer's weights, ensuring
                 # that at most one full decoder layer is resident.
                 mx.eval(h)
@@ -408,6 +528,7 @@ class MiniMaxH3TextEncoder:
 
         model = self.language
         h = model.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        h = replace_visual_rows(h, visual_embeds)
         mask = create_attention_mask(h, None)
 
         position_embeddings = None
@@ -417,7 +538,9 @@ class MiniMaxH3TextEncoder:
         for layer_idx, layer in enumerate(model.layers):
             h = layer(h, mask, None, position_ids, position_embeddings)
             if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
-                h = model._deepstack_process(h, visual_pos_masks, deepstack_visual_embeds[layer_idx])
+                h = model._deepstack_process(
+                    h, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                )
         # No `model.norm(h)`: H3 conditions on the unnormalized state.
         return h
 
@@ -431,6 +554,7 @@ class MiniMaxH3TextEncoder:
         visual_pos_masks = None
         deepstack_embeds = None
         grid_thw = None
+        visual_embeds = None
 
         if vision_inputs is not None:
             if self.vision is None:
@@ -440,10 +564,43 @@ class MiniMaxH3TextEncoder:
             hidden, deepstack_embeds = self.vision(
                 mx.array(pixel_values).astype(self.dtype), grid_thw, output_hidden_states=True
             )
-            inputs_embeds = self.language.embed_tokens(input_ids)
             image_mask = input_ids == self.image_token_id
-            inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
             visual_pos_masks = image_mask
+            image_rows = int(np.asarray(image_mask).sum())
+            if hidden.shape[0] != image_rows:
+                raise ValueError(
+                    f"visual rows/image-pad mismatch: observed {hidden.shape[0]} visual rows, "
+                    f"expected {image_rows} image-pad positions"
+                )
+            if deepstack_embeds is None:
+                deepstack_embeds = []
+            for index, deepstack in enumerate(deepstack_embeds):
+                if deepstack.shape[0] != image_rows:
+                    raise ValueError(
+                        f"deep-stack visual rows/image-pad mismatch at index {index}: observed "
+                        f"{deepstack.shape[0]} rows, expected {image_rows} image-pad positions"
+                    )
+            visual_embeds = hidden.astype(self.dtype)
+            deepstack_embeds = [value.astype(self.dtype) for value in deepstack_embeds]
+            if self.stream_layers:
+                def detach_visual(array: mx.array) -> mx.array:
+                    if self.dtype == mx.bfloat16:
+                        host = np.array(array.view(mx.uint16), copy=True)
+                        detached = mx.array(host, dtype=mx.uint16).view(mx.bfloat16)
+                    else:
+                        host = np.array(array.astype(self.dtype), copy=True)
+                        detached = mx.array(host).astype(self.dtype)
+                    mx.eval(detached)
+                    return detached
+
+                visual_embeds = detach_visual(visual_embeds)
+                deepstack_embeds = [detach_visual(value) for value in deepstack_embeds]
+                self.vision = None
+                del hidden, pixel_values
+                gc.collect()
+                clear_cache = getattr(mx, "clear_cache", None)
+                if clear_cache is not None:
+                    clear_cache()
 
         # Qwen3-VL's 3D M-RoPE index, derived from the vision-start/pad token ids.
         position_ids, _ = LanguageModel.get_rope_index(
@@ -456,6 +613,7 @@ class MiniMaxH3TextEncoder:
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_embeds,
+            visual_embeds=visual_embeds,
         )
         mx.eval(hidden_states)
         return hidden_states, token_tags
