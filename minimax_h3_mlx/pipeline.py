@@ -21,6 +21,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+from PIL import ImageOps
 
 from .adaln import ModulationCache, drop_adaln_weights
 from .block_cache import BlockCacheConfig, BlockResidualCache
@@ -42,6 +43,7 @@ from .packing import (
     build_packed_sequence,
     build_row_timesteps,
     patchify_video_latents,
+    prepare_keyframe_image,
     resolve_canvas_size,
     unpack_audio_tokens,
     unpatchify_video_tokens,
@@ -411,7 +413,7 @@ class MiniMaxH3Pipeline:
         MLX's RNG differs from torch's, so the seed-42 draw is not bit-identical to the reference's;
         the distribution and every other step are.
         """
-        from .packing import KEYFRAME_ENCODE_SEED, prepare_keyframe_image
+        from .packing import KEYFRAME_ENCODE_SEED
 
         cfg = self._video_config
         latents_mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
@@ -422,8 +424,12 @@ class MiniMaxH3Pipeline:
         mx.random.seed(KEYFRAME_ENCODE_SEED)
         rows = []
         for index, image in enumerate(images):
-            prepared = prepare_keyframe_image(image, height, width, stretch=index == 0)
-            pixels = np.asarray(prepared, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
+            if image.size != (width, height):
+                raise ValueError(
+                    f"keyframe[{index}] must already be prepared at {width}x{height}, got "
+                    f"{image.size[0]}x{image.size[1]}"
+                )
+            pixels = np.asarray(image, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
             pixels = (pixels / 255.0 - pixel_mean) / pixel_std
 
             # (1, 3, 1, H, W) -> channels-last for the spatial encoder.
@@ -471,8 +477,44 @@ class MiniMaxH3Pipeline:
         """
         run_started = time.perf_counter()
 
-        if self._low_memory and images:
-            raise NotImplementedError("low-memory mode currently supports text-to-video only")
+        # Resolve and prepare every keyframe before constructing a phase-owned model. This keeps
+        # invalid requests fail-closed and gives Qwen vision and VideoVAE exactly the same pixels.
+        images = [] if images is None else list(images)
+        if len(images) > 2:
+            raise ValueError(f"MiniMax-H3 accepts at most two keyframes, got {len(images)}.")
+        images = [ImageOps.exif_transpose(image).convert("RGB") for image in images]
+        keyframe_anchors = tuple(keyframe_anchors)
+        if len(keyframe_anchors) != len(images):
+            raise ValueError(
+                f"keyframe anchor count must match image count: observed {len(keyframe_anchors)} anchors "
+                f"for {len(images)} images"
+            )
+        if len(images) == 1 and keyframe_anchors not in (("first",), ("last",)):
+            raise ValueError(
+                f"one keyframe requires anchor ('first',) or ('last',), got {keyframe_anchors}"
+            )
+        if len(images) == 2 and keyframe_anchors != ("first", "last"):
+            raise ValueError(
+                "two keyframes require anchors ('first', 'last') in packed order, "
+                f"got {keyframe_anchors}"
+            )
+        if (height is None) != (width is None):
+            raise ValueError("`height` and `width` must be supplied together, or both omitted.")
+        if height is not None:
+            if height <= 0 or width <= 0 or height % 32 or width % 32:
+                raise ValueError(
+                    f"`height` and `width` must be positive multiples of 32, got {height}x{width}."
+                )
+        elif images:
+            height, width = resolve_canvas_size(*images[0].size)
+        else:
+            height, width = resolve_canvas_size(*aspect)
+        prepared_images = [
+            prepare_keyframe_image(image, height, width, stretch=index == 0)
+            for index, image in enumerate(images)
+        ]
+        image_request = prepared_images if prepared_images else None
+
         if self._low_memory:
             from .text_encoder import MiniMaxH3TextEncoder
 
@@ -481,11 +523,12 @@ class MiniMaxH3Pipeline:
                 "load_overhead",
                 lambda: MiniMaxH3TextEncoder(
                     self._text_encoder_path,
-                    load_vision=False,
+                    load_vision=bool(images),
                     verbose=verbose,
                     tokenizer_dir=self._checkpoint_root / "tokenizer",
                     processor_dir=self._checkpoint_root / "processor",
                     stream_layers=True,
+                    vision_model_dir=self._checkpoint_root / "text_encoder" if images else None,
                 ),
                 eval_output=False,
             )
@@ -494,7 +537,7 @@ class MiniMaxH3Pipeline:
         prompt_embeds, text_token_tags = profiled_call(
             "pipeline.text_encoder_encode",
             "text_conditioning",
-            lambda: self.text_encoder.encode(prompt, images),
+            lambda: self.text_encoder.encode(prompt, image_request),
             metadata={"has_images": bool(images)},
         )
         if self._low_memory:
@@ -502,6 +545,33 @@ class MiniMaxH3Pipeline:
             text_token_tags = np.array(text_token_tags, copy=True)
             self._release_component("text_encoder")
 
+        # 2. Keyframe conditioning. In low-memory image mode, VideoVAE is a short-lived phase
+        # between text and DiT; T2V deliberately skips this load and retains the old decode path.
+        condition_rows = None
+        if images:
+            if self._low_memory:
+                from .load import load_video_vae
+
+                self.video_vae = profiled_call(
+                    "load.video_vae_low_memory",
+                    "load_overhead",
+                    lambda: load_video_vae(self._checkpoint_root / "video_vae"),
+                    eval_output=False,
+                )
+            condition_rows = profiled_call(
+                "pipeline.encode_keyframes",
+                "conditioning_encode",
+                lambda: self._encode_keyframes(prepared_images, height, width),
+            )
+            if self._low_memory:
+                condition_rows = mx.array(
+                    np.array(condition_rows, dtype=np.float32, copy=True), dtype=mx.float32
+                )
+                mx.eval(condition_rows)
+                self._release_component("video_vae")
+
+        # 3. Streaming DiT is loaded only after all image conditioning has been materialized.
+        if self._low_memory:
             from .streaming import load_streaming_dit
 
             self.dit, self._block_provider = profiled_call(
@@ -527,11 +597,7 @@ class MiniMaxH3Pipeline:
             if self._memory_pressure_guard:
                 self._memory_guard_boundary()
 
-        # 2. Geometry.
-        if height is None or width is None:
-            height, width = resolve_canvas_size(*aspect)
-        elif height % 32 or width % 32:
-            raise ValueError(f"`height` and `width` must be multiples of 32, got {height}x{width}.")
+        # 4. Geometry.
         num_frames = align_num_frames(int(round(duration_seconds * FPS)))
         num_latent_frames = video_latent_num_frames(num_frames)
         ratio = self._video_config.spatial_compression_ratio
@@ -554,16 +620,7 @@ class MiniMaxH3Pipeline:
             print(f"packed sequence: {layout.sequence_length:,} rows "
                   f"({len(text_token_tags):,} text, {layout.num_condition_video_rows:,} condition)")
 
-        # 3. Keyframe conditioning rows, encoded before any request noise is drawn.
-        condition_rows = None
-        if images:
-            condition_rows = profiled_call(
-                "pipeline.encode_keyframes",
-                "conditioning_encode",
-                lambda: self._encode_keyframes(images, height, width),
-            )
-
-        # 4. Initial noise. Draw order matches the reference — the conditioning noise comes off the
+        # 5. Initial noise. Draw order matches the reference — the conditioning noise comes off the
         #    request generator first, then video, then audio — so a seed reproduces the same run.
         mx.random.seed(seed)
         if condition_rows is not None:
@@ -583,7 +640,7 @@ class MiniMaxH3Pipeline:
         if condition_rows is not None:
             video_rows = mx.concatenate([condition_rows, video_rows])
 
-        # 5. Two schedules over one shared forward.
+        # 6. Two schedules over one shared forward.
         video_sched, audio_sched = self._build_schedules(num_inference_steps)
         timestep_table, plan = self._row_timestep_plan(layout, video_sched.timesteps, audio_sched.timesteps)
         profiled_call(
@@ -624,7 +681,7 @@ class MiniMaxH3Pipeline:
             else None
         )
 
-        # 6. Denoise. One forward per step; only generated rows are written back, so the
+        # 7. Denoise. One forward per step; only generated rows are written back, so the
         #    conditioning anchors survive without any masking.
         step_times = []
         for i, t in enumerate(video_sched.timesteps.tolist()):
@@ -685,7 +742,7 @@ class MiniMaxH3Pipeline:
                 print(f"  step {done}/{len(video_sched.timesteps)}  "
                       f"{step_times[-1]:.1f}s  eta {eta / 60:.1f} min", flush=True)
 
-        # 7. Decode both modalities.
+        # 8. Decode both modalities.
         if self._low_memory:
             video_rows = mx.array(np.array(video_rows[n_cond_v:]), dtype=mx.float32)
             audio_rows = mx.array(np.array(audio_rows[n_cond_a:]), dtype=mx.float32)

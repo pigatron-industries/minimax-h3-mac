@@ -374,9 +374,41 @@ caffeinate -dimsu .venv/bin/python scripts/generate.py \
 
 `--steps 9` produces eight DiT forwards. The native MLX adapter records each component's rank and alpha, so **do not pass** `--turbo-lora-alpha`; the runtime keeps the BF16 LoRA update separate from the INT8 base.
 
+### Low-memory image-to-video (FL2VA)
+
+First-frame image-to-video uses the same low-memory setup with one additional `--image` / `--anchor` pair:
+
+```bash
+caffeinate -dimsu .venv/bin/python scripts/generate.py \
+  "Subtle natural motion, coherent details, smooth cinematic camera movement" \
+  --checkpoint models/MiniMax-H3/FL2VA \
+  --transformer models/MiniMax-H3-MLX-Argus-Calibrated-INT8 \
+  --text-encoder models/MiniMax-H3-MLX-TextEncoder-4bit \
+  --turbo-lora models/MiniMax-H3-Turbo-v4-step600-EMA-MLX \
+  --profile quality \
+  --low-memory \
+  --stream-blocks \
+  --image input.png \
+  --anchor first \
+  --duration 5 \
+  --steps 9 \
+  --memory-pressure-guard \
+  --no-block-cache \
+  --output out/i2v-first-frame.mp4
+```
+
+Use `--anchor last` for a last-frame-only constraint. Repeat the arguments in order for first-and-last conditioning:
+
+```bash
+--image first.png --anchor first \
+--image last.png  --anchor last
+```
+
+When `--resolution` is omitted, the first keyframe determines the canvas aspect ratio. The low-memory route runs vision/text encoding, keyframe Video VAE encoding, and the streamed DiT as separate phases, releasing each model between phases. `--text-encoder` replaces only the quantized language weights; the Qwen vision tower needed for image-to-video still comes from `text_encoder` under `--checkpoint`, so both directories must belong to the same FL2VA release.
+
 ## 4. Measured result on the 24 GB M4 Pro
 
-The command above completed end to end on the same 24 GB M4 Pro MacBook Pro:
+The T2V command in `## 3` without `--image` completed end to end on the same 24 GB M4 Pro MacBook Pro; the table below is not a performance claim for the I2V example above:
 
 | Item | Measured result |
 |---|---:|

@@ -97,6 +97,9 @@ def main() -> None:
             memory_limit_gb=1.0,
         )
         assert pipe._low_memory is True
+        assert pipe._checkpoint_root == root
+        assert pipe._text_encoder_path == text
+        assert pipe._dit_path == dit
         assert pipe.text_encoder is None
         assert pipe.dit is None
         assert pipe.video_vae is None
